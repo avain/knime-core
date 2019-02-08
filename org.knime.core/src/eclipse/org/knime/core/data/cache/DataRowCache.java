@@ -57,6 +57,7 @@ import org.knime.core.data.DataRow;
 import org.knime.core.data.DataTable;
 import org.knime.core.data.DataTableSpec;
 import org.knime.core.data.RowIterator;
+import org.knime.core.data.RowIteratorBuilder;
 import org.knime.core.data.RowKey;
 import org.knime.core.data.container.CloseableRowIterator;
 import org.knime.core.data.container.ContainerTable;
@@ -192,6 +193,8 @@ public class DataRowCache {
      * sorted table). */
     private DataTable m_originalUnsortedTable;
 
+    private String[] m_includedColumnIndices;
+
     public DataRowCache() {
         m_maxRowCount = 0;
         m_isMaxRowCountFinal = true; // no data seen, assume final row count
@@ -211,6 +214,22 @@ public class DataRowCache {
      * @param data the new data being displayed or <code>null</code>
      */
     public void setDataTable(final DataTable data, final ExecutionMonitor exec) {
+        setDataTableIntern(data, data, null, exec);
+    }
+
+    /**
+     * Sets new data for this table. The argument may be <code>null</code> to
+     * indicate invalid data (nothing displayed). Additionally an array of column indices to be included in the cache
+     * may be given to take advantage of faster data access through columnar storage.
+     *
+     * @param data
+     * @param exec
+     * @param includedColumnIndices
+     */
+    public void setDataTable(final DataTable data, final ExecutionMonitor exec, final String... includedColumns) {
+        if (includedColumns.length > 0) {
+            m_includedColumnIndices = includedColumns;
+        }
         setDataTableIntern(data, data, null, exec);
     }
 
@@ -654,11 +673,17 @@ public class DataRowCache {
      * the table is an instance of {@link BufferedDataTable}. */
     private RowIterator getNewDataIterator() {
         assert hasData();
-        if (m_data instanceof BufferedDataTable) {
+        // TODO: find a different solution for the Swing table view, can't use the fail prove iterator with the iterator
+        // builder
+        /* if (m_data instanceof BufferedDataTable) {
             return ((BufferedDataTable)m_data).iteratorFailProve();
+        } */
+
+        RowIteratorBuilder<? extends RowIterator> iteratorBuilder = m_data.iteratorBuilder();
+        if (m_includedColumnIndices != null) {
+            iteratorBuilder.filterColumns(m_includedColumnIndices);
         }
-        // TODO: iterator needs to be created with builder to take advantage of Parquet
-        return m_data.iterator();
+        return iteratorBuilder.build();
     }
 
     /**
