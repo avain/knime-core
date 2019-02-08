@@ -5,18 +5,28 @@ library "knime-pipeline@$BRANCH_NAME"
 properties([
   parameters([
     stringParam(
+      name: '${P2_REPO}',
+      defaultValue: 'https://jenkins.knime.com/p2-sites/knime/',
+      description: 'KNIME P2 base repo'
+    ),
+    stringParam(
+      name: 'REPO_PATH',
+      defaultValue: 'build%252FDEVOPS-35_standalone-knime-core-build/repository/',
+      description: 'Name of the branch to build.'
+    ),
+    stringParam(
       name: 'BRANCH_NAME',
       defaultValue: 'build/DEVOPS-35_standalone-knime-core-build',
       description: 'Name of the branch to build.'
     ),
     stringParam(
       name: 'KNIME_TP_P2',
-      defaultValue: '${P2_REPO}/knime-tp/',
+      defaultValue: '${P2_REPO}/knime-tp/$REPO_PATH',
       description: 'KNIME Target Platform P2 update site url.'
     ),
     stringParam(
       name: 'KNIME_SHARED_P2',
-      defaultValue: '${P2_REPO}/knime-shared/',
+      defaultValue: '${P2_REPO}/knime-shared/$REPO_PATH',
       description: 'org.knime.update.shared site url.'
     )
   ]),
