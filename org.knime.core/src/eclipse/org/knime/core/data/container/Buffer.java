@@ -144,6 +144,40 @@ public class Buffer implements KNIMEStreamConstants {
     /** The node logger for this class. */
     private static final NodeLogger LOGGER = NodeLogger.getLogger(Buffer.class);
 
+    /**
+     * Default minimum disc space requirement, see {@link KNIMEConstants#PROPERTY_MIN_FREE_DISC_SPACE_IN_TEMP_IN_MB}.
+     *
+     * @since 2.8
+     */
+    private static final int DEF_MIN_FREE_DISC_SPACE_IN_TEMP_IN_MB = 100;
+    /**
+     * Minimum disc space requirement, see {@link KNIMEConstants#PROPERTY_MIN_FREE_DISC_SPACE_IN_TEMP_IN_MB}.
+     *
+     * @since 2.8
+     */
+    private static final int MIN_FREE_DISC_SPACE_IN_TEMP_IN_MB;
+
+    static {
+        // initialize the min free disc in temp
+        int minFreeDiscSpaceMB = DEF_MIN_FREE_DISC_SPACE_IN_TEMP_IN_MB;
+        String minFree = System.getProperty(KNIMEConstants.PROPERTY_MIN_FREE_DISC_SPACE_IN_TEMP_IN_MB);
+        if (minFree != null) {
+            String s = minFree.trim();
+            try {
+                int newSize = Integer.parseInt(s);
+                if (newSize < 0) {
+                    throw new NumberFormatException("minFreeDiscSpace < 0" + newSize);
+                }
+                minFreeDiscSpaceMB = newSize;
+                LOGGER.debug("Setting min free disc space to " + minFreeDiscSpaceMB + "MB");
+            } catch (NumberFormatException e) {
+                LOGGER.warn("Unable to parse property \"" + KNIMEConstants.PROPERTY_MIN_FREE_DISC_SPACE_IN_TEMP_IN_MB
+                    + "\", using default (" + DEF_MIN_FREE_DISC_SPACE_IN_TEMP_IN_MB + "MB)", e);
+            }
+        }
+        MIN_FREE_DISC_SPACE_IN_TEMP_IN_MB = minFreeDiscSpaceMB;
+    }
+
     /** True if ZipOutputStream / the underlying Zlib library supports changed compression level between entries.
      * This wasn't a problem for a long time (2004-2017) but broke with MacOX 10.13 (Sep '17). Relevant pointers are:
      * bugs.knime.org/AP-8083
@@ -417,20 +451,42 @@ public class Buffer implements KNIMEStreamConstants {
             .map(s -> s.toString()).collect(Collectors.joining("\n  "));
 
 
+
     /**
      * Creates new buffer for <strong>writing</strong>. It has assigned a given spec, and a max row count that may
      * resize in memory.
+     *
      * @param spec ... used to define schema (non-KNIME file formats require schema)
      * @param maxRowsInMemory Maximum numbers of rows that are kept in memory until they will be subsequent written to
      *            the temp file. (0 to write immediately to a file)
      * @param bufferID The id of this buffer used for blob (de)serialization.
      * @param dataRepository the data repository (needed for blobs, file stores, and table ids)
      * @param localRep Local table repository for blob (de)serialization.
-     * @param fileStoreHandler ...
+     * @param fileStoreHandler the file store handlers
      */
     Buffer(final DataTableSpec spec, final int maxRowsInMemory, final int bufferID,
         final IDataRepository dataRepository, final Map<Integer, ContainerTable> localRep,
         final IWriteFileStoreHandler fileStoreHandler) {
+        this(spec, maxRowsInMemory, bufferID, dataRepository, localRep, fileStoreHandler,
+            DataContainerSettings.getDefault().getOutputFormat(spec));
+    }
+
+    /**
+     * Creates new buffer for <strong>writing</strong>. It has assigned a given spec, and a max row count that may
+     * resize in memory.
+     *
+     * @param spec ... used to define schema (non-KNIME file formats require schema)
+     * @param maxRowsInMemory Maximum numbers of rows that are kept in memory until they will be subsequent written to
+     *            the temp file. (0 to write immediately to a file)
+     * @param bufferID The id of this buffer used for blob (de)serialization.
+     * @param dataRepository the data repository (needed for blobs, file stores, and table ids)
+     * @param localRep Local table repository for blob (de)serialization.
+     * @param fileStoreHandler the file store handlers
+     * @param outputFormat the output table store format
+     */
+    Buffer(final DataTableSpec spec, final int maxRowsInMemory, final int bufferID,
+        final IDataRepository dataRepository, final Map<Integer, ContainerTable> localRep,
+        final IWriteFileStoreHandler fileStoreHandler, final TableStoreFormat outputFormat) {
         assert (maxRowsInMemory >= 0);
         m_maxRowsInMem = maxRowsInMemory;
         m_list = new ArrayList<BlobSupportDataRow>();
@@ -440,15 +496,7 @@ public class Buffer implements KNIMEStreamConstants {
         m_fileStoreHandler = fileStoreHandler;
         m_dataRepository = dataRepository;
         m_spec = spec;
-        TableStoreFormat storeFormat = TableStoreFormatRegistry.getInstance().getFormatFor(spec);
-        TableStoreFormat prefFormat = TableStoreFormatRegistry.getInstance().getInstanceTableStoreFormat();
-        if (storeFormat == prefFormat) {
-            LOGGER.debugWithFormat("Using table format %s", storeFormat.getClass().getName());
-        } else {
-            LOGGER.debugWithFormat("Cannot use table format '%s' as it does not support the table schema, "
-                    + "using '%s' instead", prefFormat.getClass().getName(), storeFormat.getClass().getName());
-        }
-        m_outputFormat = storeFormat;
+        m_outputFormat = outputFormat;
         BufferTracker.getInstance().bufferCreated(this);
     }
 
@@ -496,6 +544,25 @@ public class Buffer implements KNIMEStreamConstants {
         }
         BufferTracker.getInstance().bufferCreated(this);
     }
+
+    /**
+     * Creates new <strong>empty</strong> buffer for <strong>writing</strong> from a given writing buffer.
+     *
+     * @param b the writable {@link Buffer} to be cloned
+     */
+    private Buffer(final Buffer b) {
+        m_maxRowsInMem = b.m_maxRowsInMem;
+        m_list = new ArrayList<BlobSupportDataRow>();
+        m_size = 0;
+        m_bufferID = b.m_bufferID;
+        m_localRepository = Collections.emptyMap();
+        m_fileStoreHandler = b.castAndGetFileStoreHandler();
+        m_dataRepository = b.m_dataRepository;
+        m_spec = b.m_spec;
+        m_outputFormat = b.m_outputFormat;
+        BufferTracker.getInstance().bufferCreated(this);
+    }
+
 
     /**
      * Get the version string to write to the meta file. This method is overridden in the {@link NoKeyBuffer} to
@@ -1434,8 +1501,7 @@ public class Buffer implements KNIMEStreamConstants {
      * @return A new buffer with the same ID, which is only used locally to update the stream.
      */
     Buffer createLocalCloneForWriting() {
-        return new Buffer(m_spec, 0, getBufferID(), m_dataRepository, Collections.emptyMap(),
-            castAndGetFileStoreHandler());
+        return new Buffer(this);
     }
 
     /**
@@ -1635,20 +1701,21 @@ public class Buffer implements KNIMEStreamConstants {
     /**
      * Method being called each time a file is created. It maintains a counter and calls each
      * {@link #MAX_FILES_TO_CREATE_BEFORE_GC} files the garbage collector. This fixes an unreported problem on windows,
-     * where (although the file reference is null) there seems to be a hidden file lock, which yields a
-     * "not enough system resources to perform operation" error.
+     * where (although the file reference is null) there seems to be a hidden file lock, which yields a "not enough
+     * system resources to perform operation" error.
+     *
      * @param file The existing file
      * @throws IOException If there is not enough space left on the partition of the temp folder
      */
     static void onFileCreated(final File file) throws IOException {
         int count = FILES_CREATED_COUNTER.incrementAndGet();
         long freeSpace = file.exists() ? file.getUsableSpace() : Long.MAX_VALUE;
-        long minSpace = DataContainer.MIN_FREE_DISC_SPACE_IN_TEMP_IN_MB * (1024L * 1024L);
+        long minSpace = MIN_FREE_DISC_SPACE_IN_TEMP_IN_MB * (1024L * 1024L);
         if (freeSpace < minSpace) {
-            throw new IOException("The partition of the temp file \"" + file.getAbsolutePath()
-                    + "\" is too low on disc space (" + freeSpace / (1024 * 1024) + "MB available but at least "
-                    + DataContainer.MIN_FREE_DISC_SPACE_IN_TEMP_IN_MB + "MB are required). "
-                    + " You can tweak the limit by changing the \""
+            throw new IOException(
+                "The partition of the temp file \"" + file.getAbsolutePath() + "\" is too low on disc space ("
+                    + freeSpace / (1024 * 1024) + "MB available but at least " + MIN_FREE_DISC_SPACE_IN_TEMP_IN_MB
+                    + "MB are required). " + " You can tweak the limit by changing the \""
                     + KNIMEConstants.PROPERTY_MIN_FREE_DISC_SPACE_IN_TEMP_IN_MB + "\" java property.");
         }
         if (count % MAX_FILES_TO_CREATE_BEFORE_GC == 0) {
