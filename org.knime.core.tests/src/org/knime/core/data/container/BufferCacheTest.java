@@ -52,6 +52,7 @@ import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Optional;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
@@ -66,6 +67,7 @@ import org.knime.core.data.def.DoubleCell;
 import org.knime.core.data.def.IntCell;
 import org.knime.core.data.def.LongCell;
 import org.knime.core.data.def.StringCell;
+import org.knime.core.data.util.memory.MemoryAlertSystemTest;
 import org.knime.core.util.Pair;
 
 /**
@@ -98,13 +100,13 @@ public class BufferCacheTest {
 
         // check if get and contains methods respect invalidation of tables
         for (int i = 0; i < k; i++) {
-            final Buffer table = tables.get(i).getFirst();
+            final Buffer buffer = tables.get(i).getFirst();
             if (i % 2 == 0) {
-                Assert.assertNull("Invalidated table still in cache.", cache.get(table));
-                Assert.assertFalse("Invalidated table still in cache.", cache.contains(table));
+                Assert.assertEquals("Invalidated table still in cache.", cache.get(buffer), Optional.empty());
+                Assert.assertFalse("Invalidated table still in cache.", cache.contains(buffer));
             } else {
-                Assert.assertNotNull("Table no longer in cache.", cache.get(table));
-                Assert.assertTrue("Invalidated table still in cache.", cache.contains(table));
+                Assert.assertNotEquals("Table no longer in cache.", cache.get(buffer), Optional.empty());
+                Assert.assertTrue("Invalidated table still in cache.", cache.contains(buffer));
             }
         }
     }
@@ -112,9 +114,11 @@ public class BufferCacheTest {
     /**
      * Tests that when tables are cleared for garbage collection, only least-recently-used ("hot") tables are kept in
      * memory subsequent to garbage collection.
+     *
+     * @throws InterruptedException thrown when the thread is unexpectedly interrupted during sleep.
      */
     @Test
-    public void testSoftRefCache() {
+    public void testSoftRefCache() throws InterruptedException {
         // generate k-1 hot tables and k cold tables where k equals the LRU cache size -1
         List<Pair<Buffer, List<BlobSupportDataRow>>> hotTables = generateKTables(BufferCache.LRU_CACHE_SIZE - 1, true);
         List<Pair<Buffer, List<BlobSupportDataRow>>> coldTables = generateKTables(BufferCache.LRU_CACHE_SIZE, true);
@@ -143,22 +147,19 @@ public class BufferCacheTest {
         hotTables = null;
         coldTables = null;
 
-        // invoke garbage collection and hope that it collects weakly referenced tables
-        System.gc();
-        try {
-            Thread.sleep(100);
-        } catch (InterruptedException e) {
-        }
+        // invoke garbage collection
+        MemoryAlertSystemTest.forceGC();
 
         // check that all hot tables (buffers and lists) are still in the cache (due to them being softly referenced)
         for (Pair<WeakReference<Buffer>, WeakReference<List<BlobSupportDataRow>>> weakenedHotTable : weakenedHotTables) {
             final Buffer buffer = weakenedHotTable.getFirst().get();
             final List<BlobSupportDataRow> list = weakenedHotTable.getSecond().get();
-            final List<BlobSupportDataRow> listFromCache = cache.get(buffer);
+            final Optional<List<BlobSupportDataRow>> listFromCache = cache.get(buffer);
             Assert.assertNotNull("Reference to buffer has been dropped unexpectedly.", buffer);
             Assert.assertNotNull("Reference to list has been dropped unexpectedly.", list);
-            Assert.assertNotNull("List could not be retrieved from cache.", listFromCache);
-            Assert.assertEquals("List retrieved from cache differs from list put into cache.", list, listFromCache);
+            Assert.assertTrue("List could not be retrieved from cache.", listFromCache.isPresent());
+            Assert.assertEquals("List retrieved from cache differs from list put into cache.", list,
+                listFromCache.get());
         }
 
         // check that all cold tables (buffers and lists) have been dropped (due to them being only weakly referenced)

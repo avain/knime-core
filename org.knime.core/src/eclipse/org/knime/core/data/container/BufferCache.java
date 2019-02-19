@@ -51,12 +51,13 @@ package org.knime.core.data.container;
 import java.lang.ref.SoftReference;
 import java.lang.ref.WeakReference;
 import java.util.Collections;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.WeakHashMap;
 
 import org.knime.core.data.container.Buffer.Lifecycle;
+import org.knime.core.util.LRUCache;
 
 /**
  * A data structure that manages which tables (i.e., {@link List} of {@link BlobSupportDataRow}) to keep in memory. The
@@ -74,12 +75,12 @@ final class BufferCache {
     /**
      * A number that determines how many tables are kept in the soft-references LRU cache before being weak-referenced.
      */
-    static final int LRU_CACHE_SIZE = 16;
+    static final int LRU_CACHE_SIZE = 32;
 
     /**
      * A map of hard references to tables held in this cache. Caution: the garbage collector will not clear these
      * automatically. We use the buffer itself as key, since multiple buffers can have the same id. The Map has to have
-     * weak keys such that otherwise unreferenced buffers can be garbage-collected.
+     * weak keys such that unreferenced buffers can be garbage-collected if we forget to clear them.
      */
     private Map<Buffer, List<BlobSupportDataRow>> m_hardMap = new WeakHashMap<>();
 
@@ -88,17 +89,8 @@ final class BufferCache {
      * they were last accessed. When memory becomes scarce, the garbage collector should clear weak-referenced tables
      * first and then proceed with soft-referenced tables in the order in which they were least recently used.
      */
-    private Map<Buffer, SoftReference<List<BlobSupportDataRow>>> m_LRUCache =
-        new LinkedHashMap<Buffer, SoftReference<List<BlobSupportDataRow>>>(LRU_CACHE_SIZE, 0.75f, true) {
-            private static final long serialVersionUID = 1L;
-
-            /** {@inheritDoc} */
-            @Override
-            protected boolean
-                removeEldestEntry(final java.util.Map.Entry<Buffer, SoftReference<List<BlobSupportDataRow>>> eldest) {
-                return size() > LRU_CACHE_SIZE;
-            }
-        };
+    private LRUCache<Buffer, SoftReference<List<BlobSupportDataRow>>> m_LRUCache =
+        new LRUCache<>(LRU_CACHE_SIZE, LRU_CACHE_SIZE);
 
     /** A map of weak references to tables evicted from the LRU cache. */
     private Map<Buffer, WeakReference<List<BlobSupportDataRow>>> m_weakCache = new WeakHashMap<>();
@@ -129,7 +121,7 @@ final class BufferCache {
      * @param buffer the buffer which table that is to be cleared for garbage collection is associated with
      */
     synchronized void clearForGarbageCollection(final Buffer buffer) {
-        assert buffer.usesOutFile();
+        assert buffer.isFlushedToDisk();
         m_hardMap.remove(buffer);
     }
 
@@ -152,15 +144,15 @@ final class BufferCache {
      * Retrieve the table associated with a buffer from the cache.
      *
      * @param buffer the buffer which the to-be-retrieved table is associated with
-     * @return a table represented as a list of datarows
+     * @return a table represented as a list of datarows, if such a table is present in the cache
      */
-    synchronized List<BlobSupportDataRow> get(final Buffer buffer) {
+    synchronized Optional<List<BlobSupportDataRow>> get(final Buffer buffer) {
         /** Update recent access in LRU cache and soft reference. */
         SoftReference<List<BlobSupportDataRow>> softRef = m_LRUCache.get(buffer);
         if (softRef != null) {
             List<BlobSupportDataRow> list = softRef.get();
             if (list != null) {
-                return list;
+                return Optional.of(list);
             }
         }
         /**
@@ -174,10 +166,13 @@ final class BufferCache {
             if (list != null) {
                 /** Make sure to put the accessed table back into the LRU cache. */
                 m_LRUCache.put(buffer, new SoftReference<List<BlobSupportDataRow>>(list));
-                return list;
+                return Optional.of(list);
+            } else {
+                /** Table has been garbage collected; key and empty references can be removed. */
+                invalidate(buffer);
             }
         }
-        return null;
+        return Optional.empty();
     }
 
     /**

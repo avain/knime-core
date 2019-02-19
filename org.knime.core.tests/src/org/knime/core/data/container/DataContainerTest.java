@@ -82,6 +82,7 @@ import org.knime.core.data.def.IntCell;
 import org.knime.core.data.def.StringCell;
 import org.knime.core.data.util.ObjectToDataCellConverter;
 import org.knime.core.data.util.memory.MemoryAlertSystem;
+import org.knime.core.data.util.memory.MemoryAlertSystemTest;
 import org.knime.core.node.CanceledExecutionException;
 import org.knime.core.node.DefaultNodeProgressMonitor;
 import org.knime.core.node.ExecutionMonitor;
@@ -214,7 +215,7 @@ public class DataContainerTest extends TestCase {
         }
         container.close();
         final Buffer buffer = container.getBufferedTable().getBuffer();
-        assertFalse(buffer.heldInMemory());
+        assertFalse(buffer.isHeldInMemory());
         buffer.restoreIntoMemory();
         RowIterator tableIterator1 = container.getTable().iterator();
         RowIterator tableIterator2 = container.getTable().iterator();
@@ -241,7 +242,7 @@ public class DataContainerTest extends TestCase {
             assertEquals(referenceRow, pushRow);
             assertEquals(referenceRow, otherRow);
         }
-        assertTrue(buffer.heldInMemory());
+        assertTrue(buffer.isHeldInMemory());
         assertFalse(tableIterator1.hasNext());
         assertFalse(tableIterator2.hasNext());
 
@@ -263,7 +264,7 @@ public class DataContainerTest extends TestCase {
             assertEquals(referenceRow, row);
         }
         restoreThread.join();
-        assertTrue(buffer.heldInMemory());
+        assertTrue(buffer.isHeldInMemory());
     }
 
     private static RowIterator generateRows(final int count) {
@@ -582,7 +583,7 @@ public class DataContainerTest extends TestCase {
             row = null;
         }
         container.close();
-        assertTrue(container.getBufferedTable().getBuffer().usesOutFile());
+        assertTrue(container.getBufferedTable().getBuffer().isFlushedToDisk());
         final Throwable[] throwables = new Throwable[1];
         final ContainerTable table = container.getBufferedTable();
         table.restoreIntoMemory();
@@ -792,16 +793,18 @@ public class DataContainerTest extends TestCase {
     /**
      * Test that even medium-sized tables (larger then the container's maximum number of cells) are kept in memory. Also
      * test that once the table has been evicted from memory, it is read back into memory on next iteration.
+     *
+     * @throws InterruptedException thrown when the thread is unexpectedly interrupted during sleep.
      */
     @Test(timeout = 2000)
-    public void testMediumSizedTables() {
+    public void testMediumSizedTables() throws InterruptedException {
         // generate a medium-sized table and check that it is held in memory
         final Buffer buffer = generateMediumSizedTable();
-        Assert.assertTrue("Recently generated medium-sized table not held in memory.", buffer.heldInMemory());
+        Assert.assertTrue("Recently generated medium-sized table not held in memory.", buffer.isHeldInMemory());
 
         // this test is admittedly somewhat fishy - we assume that the table is written asynchronously and has not been
         // fully written yet (it honestly shouldn't be, since we just closed it's container).
-        Assert.assertFalse("Recently generated medium-sized table prematurely flushed to disk.", buffer.usesOutFile());
+        Assert.assertFalse("Recently generated medium-sized table prematurely flushed to disk.", buffer.isFlushedToDisk());
 
         // generate more medium-sized tables that should eventually evict the first table from the LRU cache
         for (int i = 0; i < BufferCache.LRU_CACHE_SIZE; i++) {
@@ -809,17 +812,13 @@ public class DataContainerTest extends TestCase {
         }
 
         // once evicted from the LRU cache, the table should only be weakly referenced and can be garbage-collected
-        while (buffer.heldInMemory()) {
+        while (buffer.isHeldInMemory()) {
             // invoke garbage collection and hope that it collects weakly referenced tables
-            System.gc();
-            try {
-                Thread.sleep(100);
-            } catch (InterruptedException e) {
-            }
+            MemoryAlertSystemTest.forceGC();
         }
 
         // we should check that now that the table is no longer held in memory, it has actually been written to a file
-        Assert.assertTrue("Medium-sized table dropped from memory but not written to disk.", buffer.usesOutFile());
+        Assert.assertTrue("Medium-sized table dropped from memory but not written to disk.", buffer.isFlushedToDisk());
 
         // finally, we iterate over the table and make sure that it has been read back into memory
         try (final CloseableRowIterator it = buffer.iteratorBuilder().build();) {
@@ -827,8 +826,8 @@ public class DataContainerTest extends TestCase {
                 it.next();
             }
         }
-        Assert.assertTrue("Medium-sized table not read back into memory from disk.", buffer.heldInMemory());
-        Assert.assertTrue("Previously flushed medium-sized table not flushed any more.", buffer.usesOutFile());
+        Assert.assertTrue("Medium-sized table not read back into memory from disk.", buffer.isHeldInMemory());
+        Assert.assertTrue("Previously flushed medium-sized table not flushed any more.", buffer.isFlushedToDisk());
     }
 
     /**

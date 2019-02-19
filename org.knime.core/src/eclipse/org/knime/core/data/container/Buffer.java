@@ -75,10 +75,15 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 import java.util.zip.Deflater;
 import java.util.zip.GZIPOutputStream;
@@ -127,11 +132,10 @@ import org.knime.core.node.NodeLogger;
 import org.knime.core.node.NodeSettings;
 import org.knime.core.node.NodeSettingsRO;
 import org.knime.core.node.NodeSettingsWO;
+import org.knime.core.node.workflow.NodeContext;
 import org.knime.core.util.FileUtil;
 import org.knime.core.util.ShutdownHelper;
 import org.knime.core.util.ThreadUtils;
-
-import net.sf.saxon.sort.LRUCache;
 
 /**
  * A buffer writes the rows from a {@link DataContainer} to a file. This class serves as connector between the
@@ -299,8 +303,12 @@ public class Buffer implements KNIMEStreamConstants {
     /** The default for whether to use the {@link SoftRefLRUAsyncWriteLifecycle} as opposed to the {@link MemorizeIfSmallLifecycle}. */
     static final String DEF_TABLE_CACHE = "LRU";
 
-    /** Whether to use an {@link SoftRefLRUAsyncWriteLifecycle} as opposed to the {@link MemorizeIfSmallLifecycle}. */
-    static final boolean ENABLE_LRU;
+    /**
+     * Whether to use an SoftRefLRUAsyncWriteLifecycle as opposed to the MemorizeIfSmallLifecycle.
+     *
+     * @since 3.8
+     */
+    public static final boolean ENABLE_LRU;
 
     static {
         final String envTableCache = PROPERTY_TABLE_CACHE;
@@ -323,6 +331,21 @@ public class Buffer implements KNIMEStreamConstants {
 
     /** A cache for holding tables in memory. */
     private static final BufferCache CACHE = new BufferCache();
+
+    /** The maximum number of asynchronous write threads, each additional container will be queued. */
+    static final int MAX_ASYNC_WRITE_THREADS = 1;
+
+    /** A thread pool for asynchronous disk I/O threads. */
+    private static final ThreadPoolExecutor ASYNC_EXECUTORS = new ThreadPoolExecutor(0, MAX_ASYNC_WRITE_THREADS, 365L,
+        TimeUnit.DAYS, new LinkedBlockingQueue<Runnable>(), new ThreadFactory() {
+            private final AtomicInteger m_threadCount = new AtomicInteger();
+
+            /** {@inheritDoc} */
+            @Override
+            public Thread newThread(final Runnable r) {
+                return new Thread(r, "KNIME-DiskIO-" + m_threadCount.incrementAndGet());
+            }
+        });
 
     /**
      * Hash used to reduce the overhead of reading a blob cell over and over again. Useful in cases where a blob is
@@ -412,8 +435,8 @@ public class Buffer implements KNIMEStreamConstants {
     /** The lifecycle of this buffer, which specifies when and how tables are cached and flushed to disk. */
     private final Lifecycle m_lifecycle;
 
-    /** A flag that is set when this buffer has been flushed to disk (for whatever reason). If the buffer has been */
-    private boolean m_usesOutFile;
+    /** A flag that is set when this buffer has been flushed to disk (for whatever reason). */
+    private boolean m_flushedToDisk;
 
     /**
      * A table held in memory while still being modifiable and before being added to the cache. This is true in either
@@ -433,9 +456,10 @@ public class Buffer implements KNIMEStreamConstants {
 
     /**
      * The iterator that is used to read the content back into memory. This instance is used after the workflow is
-     * restored from disk.
+     * restored from disk or when a table that fits into the cache is dropped from the cache due to not having been
+     * used recently.
      */
-    private CloseableRowIterator m_backIntoMemoryIterator;
+    private WeakReference<CloseableRowIterator> m_backIntoMemoryIteratorRef;
 
     /**
      * A flag indicating whether the next call to iterator() hast to initialize m_backIntoMemoryIterator. This flag is
@@ -474,13 +498,15 @@ public class Buffer implements KNIMEStreamConstants {
      * @param dataRepository the data repository (needed for blobs, file stores, and table ids)
      * @param localRep Local table repository for blob (de)serialization.
      * @param fileStoreHandler ...
+     * @param forceSynchronousWrite whether to force the buffer disk IO thread to write synchronously
      */
     Buffer(final DataTableSpec spec, final int maxRowsInMemory, final int bufferID,
         final IDataRepository dataRepository, final Map<Integer, ContainerTable> localRep,
-        final IWriteFileStoreHandler fileStoreHandler) {
+        final IWriteFileStoreHandler fileStoreHandler, final boolean forceSynchronousWrite) {
         assert (maxRowsInMemory >= 0);
-        m_usesOutFile = false;
-        m_lifecycle = ENABLE_LRU ? new SoftRefLRUAsyncWriteLifecycle() : new MemorizeIfSmallLifecycle(maxRowsInMemory);
+        m_flushedToDisk = false;
+        m_lifecycle = ENABLE_LRU && !forceSynchronousWrite ? new SoftRefLRUAsyncWriteLifecycle()
+            : new MemorizeIfSmallLifecycle(maxRowsInMemory);
         /** independent of the lifecycle, if maxRowsInMemory is zero, the buffer is expected to flush to disk
          * (e.g, see {@link org.knime.core.data.sort.DataTableSorter#createDataContainer(DataTableSpec, boolean)}). */
         m_list = maxRowsInMemory > 0 ? new ArrayList<BlobSupportDataRow>() : null;
@@ -536,7 +562,7 @@ public class Buffer implements KNIMEStreamConstants {
         if (metaIn == null) {
             throw new IOException("No meta information given (null)");
         }
-        m_usesOutFile = true;
+        m_flushedToDisk = true;
         m_lifecycle = ENABLE_LRU ? new SoftRefLRUAsyncWriteLifecycle() : new MemorizeIfSmallLifecycle(0);
         try {
             readMetaFromFile(metaIn, fileStoreDir);
@@ -645,38 +671,6 @@ public class Buffer implements KNIMEStreamConstants {
     } // addRow(DataRow)
 
     /**
-     * Write all rows from list into file. Used while rows are added and if low mem condition is met.
-     *
-     * @param list the list of datarows to write to file
-     */
-    private final void writeAllRowsFromListToFile(final List<BlobSupportDataRow> list) {
-        try {
-            if (m_hasTempFile) {
-                ensureTempFileExists();
-                if (m_outputWriter == null) {
-                    if (!m_binFile.getParentFile().isDirectory()) {
-                        throw new FileNotFoundException(
-                            "Directory " + m_binFile.getParentFile() + " for buffer " + m_bufferID + " does not exist");
-                    }
-
-                    initOutputWriter(m_binFile);
-                    Buffer.onFileCreated(m_binFile);
-                }
-            }
-
-            if (list != null) {
-                for (BlobSupportDataRow rowInList : list) {
-                    m_outputWriter.writeRow(rowInList);
-                }
-            }
-
-            m_usesOutFile = true;
-        } catch (IOException ioe) {
-            LOGGER.error("Failed to swap to disc while freeing memory", ioe);
-        }
-    }
-
-    /**
      * @throws IOException
      */
     private void initOutputWriter(final OutputStream output) throws IOException, UnsupportedOperationException {
@@ -717,7 +711,7 @@ public class Buffer implements KNIMEStreamConstants {
             DataCell processedCell = handleIncomingBlob(cell, col, cellCount, isCopyOfExisting, forceCopyOfBlobs,
                 isWrapperCell, isCollectionCell);
             if (mustBeFlushedPriorSave(processedCell, isWrapperCell, isCollectionCell)) {
-                if (!usesOutFile()) {
+                if (!isFlushedToDisk()) {
                     LOGGER.debug("Forcing buffer to disc as it contains file store cells that need special handling");
                     flushBuffer();
                 }
@@ -1033,11 +1027,27 @@ public class Buffer implements KNIMEStreamConstants {
             m_list = null;
             m_lifecycle.onCloseIfCached();
         } else {
-            // buffer has been flushed by DC due to low memory event
+            // buffer has been flushed during initialization or by DC due to low memory event
             flushBuffer();
             closeWriterAndWriteMeta();
         }
         m_localRepository = null;
+    }
+
+    private void lazilyOpenWriter() throws IOException {
+        if (m_hasTempFile) {
+            ensureTempFileExists();
+            if (m_outputWriter == null) {
+                if (!m_binFile.getParentFile().isDirectory()) {
+                    throw new FileNotFoundException(
+                        "Directory " + m_binFile.getParentFile() + " for buffer " + m_bufferID + " does not exist");
+                }
+
+                initOutputWriter(m_binFile);
+                Buffer.onFileCreated(m_binFile);
+            }
+        }
+        m_flushedToDisk = true;
     }
 
     private void closeWriterAndWriteMeta() {
@@ -1085,7 +1095,7 @@ public class Buffer implements KNIMEStreamConstants {
             }
         }
         subSettings.addString(CFG_FILESTORES_UUID, fileStoresUUID);
-        subSettings.addBoolean(CFG_IS_IN_MEMORY, m_lifecycle.loadBackIntoMemory());
+        subSettings.addBoolean(CFG_IS_IN_MEMORY, m_lifecycle.isLoadBackIntoMemory());
         subSettings.addInt(CFG_BUFFER_ID, m_bufferID);
         subSettings.addString(CFG_TABLE_FORMAT, m_outputFormat.getClass().getName());
         NodeSettingsWO formatSettings = subSettings.addNodeSettings(CFG_TABLE_FORMAT_CONFIG);
@@ -1192,16 +1202,18 @@ public class Buffer implements KNIMEStreamConstants {
      *
      * @return true If it does.
      */
-    boolean usesOutFile() {
-        return m_usesOutFile;
+    boolean isFlushedToDisk() {
+        return m_flushedToDisk;
     }
 
     /**
-     * Does the buffer reside in memory?
+     * Does the buffer reside in memory? Use with caution and consider: if the table is held in the cache but has been
+     * cleared for garbage collection, this method will return <code>true</code>, even though the table could be
+     * garbage-collected shortly.
      *
      * @return true If it does.
      */
-    boolean heldInMemory() {
+    boolean isHeldInMemory() {
         return m_list != null || CACHE.contains(this);
     }
 
@@ -1399,22 +1411,29 @@ public class Buffer implements KNIMEStreamConstants {
     synchronized RowIteratorBuilder<? extends CloseableRowIterator> iteratorBuilder() {
         /** m_list holds datarows that are currently restored into memory by the m_backIntoMemoryIterator. If m_list is
          * null, we can look up the table in the cache. If we do not find it here, we have to iterate over the file. */
-        final List<BlobSupportDataRow> list = m_list != null ? m_list : CACHE.get(this);
+        final Optional<List<BlobSupportDataRow>> optionalList = CACHE.get(this);
+        final List<BlobSupportDataRow> list = optionalList.isPresent() ? optionalList.get() : m_list;
         if (list == null) {
             if (m_useBackIntoMemoryIterator) {
                 // the order of the following lines is very important!
                 m_useBackIntoMemoryIterator = false;
-                m_backIntoMemoryIterator = iteratorBuilder().build();
+                /** The backIntoMemoryIterator is held by the FromListIterators and is only weak-referenced in the outer
+                 * Buffer class. This way, we make sure that the reference on m_list held by the iterator wrapped by the
+                 * backIntoMemoryIterator is dropped when FromListIterators are closed. */
+                CloseableRowIterator backIntoMemoryIterator = iteratorBuilder().build();
+                m_backIntoMemoryIteratorRef = new WeakReference<CloseableRowIterator>(backIntoMemoryIterator);
                 // we never store more than 2^31 rows in memory, therefore it's safe to cast to int
-                m_list = new ArrayList<BlobSupportDataRow>((int) size());
+                m_list = new ArrayList<BlobSupportDataRow>((int)size());
 
-                return new DefaultRowIteratorBuilder<>(() -> new FromListIterator(m_list), getTableSpec());
+                return new DefaultRowIteratorBuilder<>(() -> new FromListIterator(m_list, backIntoMemoryIterator),
+                    getTableSpec());
             }
             RowIteratorBuilder<? extends TableStoreCloseableRowIterator> iteratorBuilder =
                 m_outputReader.iteratorBuilder();
             return iteratorBuilder;
         } else {
-            return new DefaultRowIteratorBuilder<>(() -> new FromListIterator(list), getTableSpec());
+            return new DefaultRowIteratorBuilder<>(() -> new FromListIterator(list,
+                m_backIntoMemoryIteratorRef != null ? m_backIntoMemoryIteratorRef.get() : null), getTableSpec());
         }
     }
 
@@ -1451,7 +1470,7 @@ public class Buffer implements KNIMEStreamConstants {
      */
     Buffer createLocalCloneForWriting() {
         return new Buffer(m_spec, 0, getBufferID(), m_dataRepository, Collections.emptyMap(),
-            castAndGetFileStoreHandler());
+            castAndGetFileStoreHandler(), true);
     }
 
     /**
@@ -1494,7 +1513,7 @@ public class Buffer implements KNIMEStreamConstants {
         // these are the conditions:
         //    !usesOutFile() --> data all kept in memory, small tables
         //    m_version< ... --> container version bump
-        if (!usesOutFile() || m_version < IVERSION) {
+        if (!isFlushedToDisk() || m_version < IVERSION) {
             // need to use new buffer since we otherwise write properties
             // of this buffer, which prevents it from further reading (version
             // conflict) - see bug #1364
@@ -1531,7 +1550,7 @@ public class Buffer implements KNIMEStreamConstants {
             }
             // bug fix #1631 ... the memory policy is not properly preserved
             // in this if-statement
-            if (usesOutFile()) {
+            if (isFlushedToDisk()) {
                 // can safely be set to null because it wrote to stream already
                 copy.m_list = null;
             }
@@ -1691,8 +1710,17 @@ public class Buffer implements KNIMEStreamConstants {
     /** Write all rows from list into file. Used while rows are added and if low mem condition is met. */
     synchronized void flushBuffer() {
         try {
-            writeAllRowsFromListToFile(m_list);
+            lazilyOpenWriter();
+
+            if (m_list != null) {
+                for (BlobSupportDataRow rowInList : m_list) {
+                    m_outputWriter.writeRow(rowInList);
+                }
+            }
+
             m_list = null; // don't write to internal cache any more
+        } catch (IOException ioe) {
+            LOGGER.error("Failed to write rows from buffer to file.", ioe);
         } catch (IllegalStateException ise) {
             LOGGER.error(ise.getMessage() + "; Construction time call stack:\n" + m_fullStackTraceAtConstructionTime);
         }
@@ -1727,7 +1755,6 @@ public class Buffer implements KNIMEStreamConstants {
 
     }
 
-
     /**
      * Iterator to be used when data is contained in m_list. It uses access by index rather than wrapping an
      * java.util.Iterator as the list may be simultaneously modified while reading (in case the content is fetched from
@@ -1738,10 +1765,13 @@ public class Buffer implements KNIMEStreamConstants {
         // do not use iterator here, see inner class comment
         private int m_nextIndex = 0;
 
+        private CloseableRowIterator m_backIntoMemoryIterator;
+
         private final List<BlobSupportDataRow> m_listReference;
 
-        FromListIterator(final List<BlobSupportDataRow> list) {
+        FromListIterator(final List<BlobSupportDataRow> list, final CloseableRowIterator backIntoMemoryIterator) {
             m_listReference = list;
+            m_backIntoMemoryIterator = backIntoMemoryIterator;
         }
 
         /**
@@ -1760,18 +1790,15 @@ public class Buffer implements KNIMEStreamConstants {
             if (!hasNext()) {
                 throw new NoSuchElementException("No more rows in buffer");
             }
-            // assignment avoids race condition in following statements
-            // (parallel thread may set m_backIntoMemoryIterator to null)
-            CloseableRowIterator backIntoMemoryIterator = m_backIntoMemoryIterator;
 
-            Object semaphore = backIntoMemoryIterator != null ? backIntoMemoryIterator : FromListIterator.this;
+            Object semaphore = m_backIntoMemoryIterator != null ? m_backIntoMemoryIterator : FromListIterator.this;
             synchronized (semaphore) {
                 // need to synchronize access to the list as the list is
                 // potentially modified by the backIntoMemoryIterator
                 if (m_nextIndex < m_listReference.size()) {
                     return m_listReference.get(m_nextIndex++);
                 }
-                if (backIntoMemoryIterator == null) {
+                if (m_backIntoMemoryIterator == null) {
                     throw new InternalError("DataRow list contains fewer elements than buffer ("
                             + m_listReference.size() + " vs. " + size() + ")");
                 }
@@ -1784,6 +1811,8 @@ public class Buffer implements KNIMEStreamConstants {
                 if (++m_nextIndex >= size()) {
                     assert !m_backIntoMemoryIterator.hasNext() : "File iterator returns more rows than buffer contains";
                     m_backIntoMemoryIterator = null;
+                    m_backIntoMemoryIteratorRef.clear();
+                    m_backIntoMemoryIteratorRef = null;
                     // ... we put the table back into the cache
                     CACHE.put(Buffer.this, m_list);
                     m_list = null;
@@ -1796,6 +1825,7 @@ public class Buffer implements KNIMEStreamConstants {
         /** {@inheritDoc} */
         @Override
         public void close() {
+            m_backIntoMemoryIterator = null;
             m_nextIndex = (int) size();
         }
     }
@@ -2031,7 +2061,7 @@ public class Buffer implements KNIMEStreamConstants {
          *
          * @return <code>true</code> iff table should be read back into memory
          */
-        boolean loadBackIntoMemory();
+        boolean isLoadBackIntoMemory();
 
         /**
          * Asynchronously called from back-into-memory iterator after the last row was read and the table was restored
@@ -2050,11 +2080,11 @@ public class Buffer implements KNIMEStreamConstants {
      *
      * @author Marc Bux, KNIME GmbH, Berlin, Germany
      */
-    class MemorizeIfSmallLifecycle implements Lifecycle {
+    final class MemorizeIfSmallLifecycle implements Lifecycle {
 
         /** maximum number of rows that are in memory. */
         private final int m_maxRowsInMem;
-        
+
         private MemoryAlertListener m_memoryAlertListener;
 
         private MemorizeIfSmallLifecycle(final int maxRowsInMem) {
@@ -2077,8 +2107,8 @@ public class Buffer implements KNIMEStreamConstants {
             m_memoryAlertListener = new MemoryAlertListener() {
                 @Override
                 protected boolean memoryAlert(final MemoryAlert alert) {
-                    final List<BlobSupportDataRow> list = CACHE.get(Buffer.this);
-                    if (list != null && !list.isEmpty()) {
+                    final Optional<List<BlobSupportDataRow>> list = CACHE.get(Buffer.this);
+                    if (list.isPresent() && !list.get().isEmpty()) {
                         ThreadUtils.threadWithContext(new Runnable() {
                             @Override
                             public void run() {
@@ -2094,11 +2124,11 @@ public class Buffer implements KNIMEStreamConstants {
 
         private void onMemoryAlert() {
             synchronized (Buffer.this) {
-            	final List<BlobSupportDataRow> list = CACHE.get(Buffer.this);
-                if (list == null) {
+            	final Optional<List<BlobSupportDataRow>> list = CACHE.get(Buffer.this);
+                if (list.isPresent()) {
                     // concurrent close or addRow() caused this to be flushed (this method may stall long on Buffer.this)
                 } else {
-                    final int nrRowsWritten = list.size();
+                    final int nrRowsWritten = list.get().size();
                     flushBuffer();
                     closeInternal();
                     CACHE.invalidate(Buffer.this);
@@ -2124,14 +2154,14 @@ public class Buffer implements KNIMEStreamConstants {
 
         /** {@inheritDoc} */
         @Override
-        public boolean loadBackIntoMemory() {
-            return !usesOutFile();
+        public boolean isLoadBackIntoMemory() {
+            return !isFlushedToDisk();
         }
 
         /** {@inheritDoc} */
         @Override
         public void onAllRowsReadBackIntoMemory() {
-            synchronized(Buffer.this) {
+            synchronized (Buffer.this) {
                 if (m_memoryAlertListener == null) {
                     m_memoryAlertListener = new MemoryAlertListener() {
                         @Override
@@ -2168,6 +2198,8 @@ public class Buffer implements KNIMEStreamConstants {
          */
         private Future<?> m_asyncAddFuture = null;
 
+        private AtomicReference<Throwable> m_writeThrowable = new AtomicReference<Throwable>();
+
         /** {@inheritDoc} */
         @Override
         public void onAddRowToList() {
@@ -2183,28 +2215,12 @@ public class Buffer implements KNIMEStreamConstants {
             restoreIntoMemory();
 
             /**
-             * We'd like to flush early so that we can garbage-collect if memory becomes critical and we don't run out
-             * of memory. At the same time, we'd like to flush late so that we don't interfere with I/O tasks in the
-             * node generating this table. In this implementation, we flush as soon as possible once the buffer has been
-             * closed (and the node likely has terminated). If at all possible, we should flush asynchronously to
-             * prevent blocking of subsequent nodes.
+             * We'd like to flush early so that we can garbage-collect if memory becomes critical and we don't run
+             * out of memory. At the same time, we'd like to flush late so that we don't interfere with I/O tasks in
+             * the node generating this table. In this implementation, we flush as soon as possible once the buffer
+             * has been closed (and the node likely has terminated).
              */
-            if (DataContainer.SYNCHRONOUS_IO
-                    || DataContainer.ASYNC_EXECUTORS.getActiveCount() > DataContainer.MAX_ASYNC_WRITE_THREADS) {
-                LOGGER.debug("Number of Table IO write threads exceeds " + DataContainer.MAX_ASYNC_WRITE_THREADS
-                    + " -- switching to synchronous write mode");
-                writeAllRowsFromListToFile(CACHE.get(Buffer.this));
-                closeWriterAndWriteMeta();
-                CACHE.clearForGarbageCollection(Buffer.this);
-            } else {
-                m_asyncAddFuture = DataContainer.ASYNC_EXECUTORS.submit(() -> {
-                    /** we have to 100% make sure no methods that are synchronized on the buffer are called in here and everything we call in
-                     * here does not interfere with other methods potentially called asynchronously on this buffer. */
-                    writeAllRowsFromListToFile(CACHE.get(Buffer.this));
-                    closeWriterAndWriteMeta();
-                    CACHE.clearForGarbageCollection(Buffer.this);
-                });
-            }
+            m_asyncAddFuture = ASYNC_EXECUTORS.submit(new ASyncWriteCallable(NodeContext.getContext()));
         }
 
         /** {@inheritDoc} */
@@ -2215,6 +2231,7 @@ public class Buffer implements KNIMEStreamConstants {
             if (m_asyncAddFuture != null) {
                 /** We should cancel the asynchronous writer thread. */
                 m_asyncAddFuture.cancel(true);
+                m_asyncAddFuture = null;
             }
         }
 
@@ -2222,13 +2239,14 @@ public class Buffer implements KNIMEStreamConstants {
         @Override
         public void beforeSave() {
             assert Thread.holdsLock(Buffer.this);
-
+            checkAsyncWriteThrowable();
             if (m_asyncAddFuture != null) {
                 /** We have to wait for the asynchronous writer thread. */
                 try {
                     m_asyncAddFuture.get();
+                    m_asyncAddFuture = null;
                 } catch (InterruptedException e) {
-                    throw new RuntimeException("Writing table to file was interrupted", e);
+                    throw new RuntimeException("Interrupted while waiting for asynchronous disk write thread", e);
                 } catch (ExecutionException e) {
                     throw new RuntimeException("Writing table to file threw exception", e);
                 }
@@ -2237,7 +2255,7 @@ public class Buffer implements KNIMEStreamConstants {
 
         /** {@inheritDoc} */
         @Override
-        public boolean loadBackIntoMemory() {
+        public boolean isLoadBackIntoMemory() {
             /** Load back into memory on workflow load if it has fit into memory before. Caution: This could entail
              * that a workflow saved on a high-memory machine cannot be loaded on a low-memory machine. However,
              * this behavior is in-line with the behavior of the MemorizeIfSmallLifecycle. */
@@ -2249,10 +2267,80 @@ public class Buffer implements KNIMEStreamConstants {
         public void onAllRowsReadBackIntoMemory() {
             synchronized (Buffer.this) {
                 CACHE.clearForGarbageCollection(Buffer.this);
-                if (loadBackIntoMemory()) {
+                if (isLoadBackIntoMemory()) {
                     /** When having read the table back into memory, we should do so again the next time we need to. */
                     restoreIntoMemory();
                 }
+            }
+        }
+
+        private void checkAsyncWriteThrowable() {
+            Throwable t = m_writeThrowable.get();
+            if (t != null) {
+                StringBuilder error = new StringBuilder();
+                if (t.getMessage() != null) {
+                    error.append(t.getMessage());
+                } else {
+                    error.append("Writing to disk process threw \"");
+                    error.append(t.getClass().getSimpleName()).append("\"");
+                }
+                throw new RuntimeException(error.toString(), t);
+            }
+        }
+
+        /**
+         * Background task that will write the output data. This is kept as static inner class in order to allow for a
+         * garbage collection of the outer class (which indicates an early stopped buffer writing).
+         */
+        private final class ASyncWriteCallable implements Callable<Void> {
+
+            private final NodeContext m_context;
+
+            /**
+             * @param context owner node information, if any.
+             */
+            ASyncWriteCallable(final NodeContext context) {
+                m_context = context;
+            }
+
+            /** {@inheritDoc} */
+            @Override
+            public Void call() throws Exception {
+                NodeContext.pushContext(m_context);
+                try {
+                    return callWithContext();
+                } finally {
+                    NodeContext.removeLastContext();
+                }
+            }
+
+            private Void callWithContext() throws Exception {
+                /** we have to 100% make sure no methods that are synchronized on the buffer are called in here and
+                 * everything we call in here does not interfere with other methods potentially called asynchronously on
+                 * this buffer. */
+                try {
+                    lazilyOpenWriter();
+
+                    List<BlobSupportDataRow> list = CACHE.get(Buffer.this).get();
+
+                    if (list != null) {
+                        for (BlobSupportDataRow rowInList : list) {
+                            m_outputWriter.writeRow(rowInList);
+                            if (Thread.interrupted()) {
+                                m_writeThrowable.compareAndSet(null, new InterruptedException(
+                                    "Asynchronoues disk write thread has been cancelled prematurely."));
+                                return null;
+                            }
+                        }
+                    }
+
+                    closeWriterAndWriteMeta();
+
+                    CACHE.clearForGarbageCollection(Buffer.this);
+                } catch (Throwable t) {
+                    m_writeThrowable.compareAndSet(null, t);
+                }
+                return null;
             }
         }
 

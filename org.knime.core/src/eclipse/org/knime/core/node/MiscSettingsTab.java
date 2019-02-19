@@ -58,6 +58,7 @@ import javax.swing.JLabel;
 import javax.swing.JPanel;
 import javax.swing.JRadioButton;
 
+import org.knime.core.data.container.Buffer;
 import org.knime.core.data.container.DataContainer;
 import org.knime.core.node.workflow.SingleNodeContainer.MemoryPolicy;
 
@@ -79,17 +80,27 @@ class MiscSettingsTab extends JPanel {
         JRadioButton cacheAll = new JRadioButton("Keep all in memory.");
         cacheAll.setActionCommand(MemoryPolicy.CacheInMemory.toString());
         m_group.add(cacheAll);
-        cacheAll.setToolTipText(
-                "All generated output data is kept in main memory, "
-                + "resulting in faster execution of successor nodes but "
-                + "also in more memory usage.");
+        if (Buffer.ENABLE_LRU) {
+            cacheAll.setToolTipText("Try to keep the table in a cache from where it will be dropped"
+                + " if it has not been recently accessed or when memory becomes scarce.");
+        } else {
+            cacheAll.setToolTipText(
+                    "All generated output data is kept in main memory, "
+                    + "resulting in faster execution of successor nodes but "
+                    + "also in more memory usage.");
+        }
         JRadioButton cacheSmall = new JRadioButton(
                 "Keep only small tables in memory.", true);
         cacheSmall.setActionCommand(MemoryPolicy.CacheSmallInMemory.toString());
         m_group.add(cacheSmall);
-        cacheSmall.setToolTipText("Tables with less than "
-                + DataContainer.MAX_CELLS_IN_MEMORY + " cells are kept in "
-                + "main memory, otherwise swapped to disc.");
+        if (Buffer.ENABLE_LRU) {
+            cacheSmall.setToolTipText("Try to keep the table in a cache from where it will be dropped"
+                + " if it has not been recently accessed or when memory becomes scarce.");
+        } else {
+            cacheSmall.setToolTipText("Tables with less than "
+                    + DataContainer.MAX_CELLS_IN_MEMORY + " cells are kept in "
+                    + "main memory, otherwise swapped to disc.");
+        }
         JRadioButton cacheOnDisc = new JRadioButton(
                 "Write tables to disc.");
         cacheOnDisc.setActionCommand(MemoryPolicy.CacheOnDisc.toString());
